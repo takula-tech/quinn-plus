@@ -145,6 +145,17 @@ pub struct Transmit<'a> {
     pub contents: &'a [u8],
     /// The segment size if this transmission contains multiple datagrams.
     /// This is `None` if the transmit only contains a single datagram
+    ///
+    /// # Example
+    /// 2 × 1200-byte QUIC packets + 1000-byte QUIC packet
+    ///
+    /// And GSO will creates 3 udp packets with QUIC packets boundaries preserved
+    /// ```ignore
+    /// Transmit {
+    ///     contents: &[u8; 2500],
+    ///     segment_size: Some(1200),
+    /// }
+    /// ```
     pub segment_size: Option<usize>,
     /// Optional source IP address for the datagram
     pub src_ip: Option<IpAddr>,

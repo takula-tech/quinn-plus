@@ -9,173 +9,114 @@ use std::{
 use quinn_udp::{EcnCodepoint, RecvMeta, Transmit, UdpSocketState};
 use socket2::Socket;
 
+const HELLO_PAYLOAD: &[u8] = b"hello";
+const GSO_SEGMENT_SIZE: usize = 128;
+const SOCKET_BUFFER_SIZE: usize = 123_456;
+const ECN_CODEPOINTS: [EcnCodepoint; 2] = [EcnCodepoint::Ect0, EcnCodepoint::Ect1];
+
 #[test]
-fn basic() {
-    let send = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
-        .or_else(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
-        .unwrap();
-    let recv = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
-        .or_else(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
-        .unwrap();
-    let dst_addr = recv.local_addr().unwrap();
+fn sends_single_datagram_over_loopback() {
+    let send_socket = bind_loopback_udp_socket();
+    let recv_socket = bind_loopback_udp_socket();
+    let destination = recv_socket.local_addr().unwrap();
+
     test_send_recv(
-        &send.into(),
-        &recv.into(),
-        Transmit {
-            destination: dst_addr,
-            ecn: None,
-            contents: b"hello",
-            segment_size: None,
-            src_ip: None,
-        },
+        &send_socket.into(),
+        &recv_socket.into(),
+        hello_transmit(destination),
     );
 }
 
 #[test]
-fn basic_src_ip() {
-    let send = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
-        .or_else(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
-        .unwrap();
-    let recv = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
-        .or_else(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
-        .unwrap();
-    let src_ip = send.local_addr().unwrap().ip();
-    let dst_addr = recv.local_addr().unwrap();
+fn sends_single_datagram_with_explicit_source_ip() {
+    let send_socket = bind_loopback_udp_socket();
+    let recv_socket = bind_loopback_udp_socket();
+    let source_ip = send_socket.local_addr().unwrap().ip();
+    let destination = recv_socket.local_addr().unwrap();
+
     test_send_recv(
-        &send.into(),
-        &recv.into(),
-        Transmit {
-            destination: dst_addr,
-            ecn: None,
-            contents: b"hello",
-            segment_size: None,
-            src_ip: Some(src_ip),
-        },
+        &send_socket.into(),
+        &recv_socket.into(),
+        hello_transmit_with_src_ip(destination, source_ip),
     );
 }
 
 #[test]
-fn ecn_v6() {
-    let send = Socket::from(UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap());
-    let recv = Socket::from(UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap());
-    for codepoint in [EcnCodepoint::Ect0, EcnCodepoint::Ect1] {
-        test_send_recv(
-            &send,
-            &recv,
-            Transmit {
-                destination: recv.local_addr().unwrap().as_socket().unwrap(),
-                ecn: Some(codepoint),
-                contents: b"hello",
-                segment_size: None,
-                src_ip: None,
-            },
-        );
-    }
+fn preserves_ecn_on_ipv6_loopback() {
+    let send_socket = bind_ipv6_socket();
+    let recv_socket = bind_ipv6_socket();
+
+    assert_ecn_round_trip(&send_socket, &recv_socket, socket_addr(&recv_socket));
 }
 
 #[test]
 #[cfg(not(any(target_os = "openbsd", target_os = "netbsd", solarish)))]
-fn ecn_v4() {
-    let send = Socket::from(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
-    let recv = Socket::from(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap());
-    for codepoint in [EcnCodepoint::Ect0, EcnCodepoint::Ect1] {
-        test_send_recv(
-            &send,
-            &recv,
-            Transmit {
-                destination: recv.local_addr().unwrap().as_socket().unwrap(),
-                ecn: Some(codepoint),
-                contents: b"hello",
-                segment_size: None,
-                src_ip: None,
-            },
-        );
-    }
+fn preserves_ecn_on_ipv4_loopback() {
+    let send_socket = bind_ipv4_socket();
+    let recv_socket = bind_ipv4_socket();
+
+    assert_ecn_round_trip(&send_socket, &recv_socket, socket_addr(&recv_socket));
 }
 
 #[test]
 #[cfg(not(any(target_os = "openbsd", target_os = "netbsd", solarish)))]
-fn ecn_v6_dualstack() {
-    let recv = socket2::Socket::new(
+fn preserves_ecn_on_dual_stack_ipv6_socket() {
+    let recv_socket = socket2::Socket::new(
         socket2::Domain::IPV6,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )
     .unwrap();
-    recv.set_only_v6(false).unwrap();
+    recv_socket.set_only_v6(false).unwrap();
     // We must use the unspecified address here, rather than a local address, to support dual-stack
     // mode
-    recv.bind(&socket2::SockAddr::from(
-        "[::]:0".parse::<SocketAddr>().unwrap(),
-    ))
-    .unwrap();
+    recv_socket
+        .bind(&socket2::SockAddr::from(
+            "[::]:0".parse::<SocketAddr>().unwrap(),
+        ))
+        .unwrap();
     let recv_v6 = SocketAddr::V6(SocketAddrV6::new(
         Ipv6Addr::LOCALHOST,
-        recv.local_addr().unwrap().as_socket().unwrap().port(),
+        socket_addr(&recv_socket).port(),
         0,
         0,
     ));
     let recv_v4 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_v6.port()));
-    for (src, dst) in [
+    for (source, destination) in [
         (SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0), recv_v6),
         (SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), recv_v4),
     ] {
-        dbg!(src, dst);
-        let send = UdpSocket::bind(src).unwrap();
-        let send = Socket::from(send);
-        for codepoint in [EcnCodepoint::Ect0, EcnCodepoint::Ect1] {
-            test_send_recv(
-                &send,
-                &recv,
-                Transmit {
-                    destination: dst,
-                    ecn: Some(codepoint),
-                    contents: b"hello",
-                    segment_size: None,
-                    src_ip: None,
-                },
-            );
-        }
+        let send_socket = Socket::from(UdpSocket::bind(source).unwrap());
+
+        assert_ecn_round_trip(&send_socket, &recv_socket, destination);
     }
 }
 
 #[test]
 #[cfg(not(any(target_os = "openbsd", target_os = "netbsd", solarish)))]
-fn ecn_v4_mapped_v6() {
-    let send = socket2::Socket::new(
+fn preserves_ecn_on_ipv4_mapped_ipv6_destination() {
+    let send_socket = socket2::Socket::new(
         socket2::Domain::IPV6,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )
     .unwrap();
-    send.set_only_v6(false).unwrap();
-    send.bind(&socket2::SockAddr::from(
-        "[::]:0".parse::<SocketAddr>().unwrap(),
-    ))
-    .unwrap();
+    send_socket.set_only_v6(false).unwrap();
+    send_socket
+        .bind(&socket2::SockAddr::from(
+            "[::]:0".parse::<SocketAddr>().unwrap(),
+        ))
+        .unwrap();
 
-    let recv = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let recv = Socket::from(recv);
+    let recv_socket = Socket::from(bind_ipv4_udp_socket());
     let recv_v4_mapped_v6 = SocketAddr::V6(SocketAddrV6::new(
         Ipv4Addr::LOCALHOST.to_ipv6_mapped(),
-        recv.local_addr().unwrap().as_socket().unwrap().port(),
+        socket_addr(&recv_socket).port(),
         0,
         0,
     ));
 
-    for codepoint in [EcnCodepoint::Ect0, EcnCodepoint::Ect1] {
-        test_send_recv(
-            &send,
-            &recv,
-            Transmit {
-                destination: recv_v4_mapped_v6,
-                ecn: Some(codepoint),
-                contents: b"hello",
-                segment_size: None,
-                src_ip: None,
-            },
-        );
-    }
+    assert_ecn_round_trip(&send_socket, &recv_socket, recv_v4_mapped_v6);
 }
 
 #[test]
@@ -183,103 +124,114 @@ fn ecn_v4_mapped_v6() {
     not(any(target_os = "linux", target_os = "windows", target_os = "android")),
     ignore
 )]
-fn gso() {
-    let send = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
-        .or_else(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
-        .unwrap();
-    let recv = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
-        .or_else(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
-        .unwrap();
-    let max_segments = UdpSocketState::new((&send).into())
+fn sends_gso_batches_over_loopback() {
+    let send_socket = bind_loopback_udp_socket();
+    let recv_socket = bind_loopback_udp_socket();
+    let max_segments = UdpSocketState::new((&send_socket).into())
         .unwrap()
         .max_gso_segments();
-    let dst_addr = recv.local_addr().unwrap();
-    const SEGMENT_SIZE: usize = 128;
-    let msg = vec![0xAB; SEGMENT_SIZE * max_segments];
+    let destination = recv_socket.local_addr().unwrap();
+    let payload = vec![0xAB; GSO_SEGMENT_SIZE * max_segments];
+
     test_send_recv(
-        &send.into(),
-        &recv.into(),
-        Transmit {
-            destination: dst_addr,
-            ecn: None,
-            contents: &msg,
-            segment_size: Some(SEGMENT_SIZE),
-            src_ip: None,
-        },
+        &send_socket.into(),
+        &recv_socket.into(),
+        gso_transmit(destination, &payload),
     );
 }
 
 #[test]
-fn socket_buffers() {
-    const BUFFER_SIZE: usize = 123456;
-    const FACTOR: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
-        2 // Linux and Android set the buffer to double the requested size
-    } else {
-        1 // Everyone else is sane.
-    };
-
-    let send = socket2::Socket::new(
+fn configures_socket_buffer_sizes() {
+    let send_socket = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )
     .unwrap();
-    let recv = socket2::Socket::new(
+    let recv_socket = socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )
     .unwrap();
-    for sock in [&send, &recv] {
-        sock.bind(&socket2::SockAddr::from(SocketAddrV4::new(
-            Ipv4Addr::LOCALHOST,
-            0,
-        )))
-        .unwrap();
-
-        let socket_state = UdpSocketState::new(sock.into()).expect("created socket state");
-
-        // Change the send buffer size.
-        let buffer_before = socket_state.send_buffer_size(sock.into()).unwrap();
-        assert_ne!(
-            buffer_before,
-            BUFFER_SIZE * FACTOR,
-            "make sure buffer is not already desired size"
-        );
-        socket_state
-            .set_send_buffer_size(sock.into(), BUFFER_SIZE)
-            .expect("set send buffer size {buffer_before} -> {BUFFER_SIZE}");
-        let buffer_after = socket_state.send_buffer_size(sock.into()).unwrap();
-        assert_eq!(
-            buffer_after,
-            BUFFER_SIZE * FACTOR,
-            "setting send buffer size to {BUFFER_SIZE} resulted in {buffer_before} -> {buffer_after}",
-        );
-
-        // Change the receive buffer size.
-        let buffer_before = socket_state.recv_buffer_size(sock.into()).unwrap();
-        socket_state
-            .set_recv_buffer_size(sock.into(), BUFFER_SIZE)
-            .expect("set recv buffer size {buffer_before} -> {BUFFER_SIZE}");
-        let buffer_after = socket_state.recv_buffer_size(sock.into()).unwrap();
-        assert_eq!(
-            buffer_after,
-            BUFFER_SIZE * FACTOR,
-            "setting recv buffer size to {BUFFER_SIZE} resulted in {buffer_before} -> {buffer_after}",
-        );
+    for socket in [&send_socket, &recv_socket] {
+        bind_ipv4_socket_addr(socket);
+        assert_socket_buffer_sizes_can_be_configured(socket);
     }
 
     test_send_recv(
-        &send,
-        &recv,
-        Transmit {
-            destination: recv.local_addr().unwrap().as_socket().unwrap(),
-            ecn: None,
-            contents: b"hello",
-            segment_size: None,
-            src_ip: None,
-        },
+        &send_socket,
+        &recv_socket,
+        hello_transmit(socket_addr(&recv_socket)),
     );
+}
+
+/// Test Apple fast datapath functionality.
+///
+/// This test verifies that:
+/// 1. `UdpSocketState::new()` auto-enables the fast path when compiled with
+///    `fast-apple-datapath`
+/// 2. `max_gso_segments()` returns `BATCH_SIZE` after initialization
+/// 3. Send/recv works correctly with the fast path enabled
+#[test]
+#[cfg(apple_fast)]
+fn apple_fast_datapath_enables_batching_and_io() {
+    let send_socket = bind_ipv4_udp_socket();
+    let recv_socket = bind_ipv4_udp_socket();
+    let destination = recv_socket.local_addr().unwrap();
+
+    let send_state = UdpSocketState::new((&send_socket).into()).unwrap();
+    let recv_state = UdpSocketState::new((&recv_socket).into()).unwrap();
+
+    // Fast path should be enabled automatically on construction
+    assert!(
+        send_state.is_apple_fast_path_enabled(),
+        "fast path should be enabled automatically after new()"
+    );
+    assert_eq!(
+        send_state.max_gso_segments(),
+        quinn_udp::BATCH_SIZE,
+        "max_gso_segments should be BATCH_SIZE after new()"
+    );
+
+    // Verify send/recv still works with fast path enabled
+    recv_socket.set_nonblocking(false).unwrap();
+
+    let segments = send_state.max_gso_segments();
+    let payload = vec![0xAB; GSO_SEGMENT_SIZE * segments];
+
+    send_state
+        .try_send((&send_socket).into(), &gso_transmit(destination, &payload))
+        .unwrap();
+
+    // Receive all segments
+    let mut receive_buffer = [0u8; u16::MAX as usize];
+    let mut total_received = 0;
+    while total_received < segments {
+        let mut recv_meta = RecvMeta::default();
+        let recv_count = recv_state
+            .recv(
+                (&recv_socket).into(),
+                &mut [IoSliceMut::new(&mut receive_buffer)],
+                slice::from_mut(&mut recv_meta),
+            )
+            .unwrap();
+        assert_eq!(recv_count, 1);
+
+        let received_segments = recv_meta.len / recv_meta.stride;
+        for segment_index in 0..received_segments {
+            assert_eq!(
+                &receive_buffer
+                    [segment_index * recv_meta.stride..(segment_index + 1) * recv_meta.stride],
+                &payload[(total_received + segment_index) * GSO_SEGMENT_SIZE
+                    ..(total_received + segment_index + 1) * GSO_SEGMENT_SIZE],
+                "segment {} content mismatch",
+                total_received + segment_index
+            );
+        }
+        total_received += received_segments;
+    }
+    assert_eq!(total_received, segments, "should receive all segments");
 }
 
 fn test_send_recv(send: &Socket, recv: &Socket, transmit: Transmit<'_>) {
@@ -291,51 +243,55 @@ fn test_send_recv(send: &Socket, recv: &Socket, transmit: Transmit<'_>) {
 
     send_state.try_send(send.into(), &transmit).unwrap();
 
-    let mut buf = [0; u16::MAX as usize];
-    let mut meta = RecvMeta::default();
+    let mut receive_buffer = [0; u16::MAX as usize];
+    let mut recv_meta = RecvMeta::default();
     let segment_size = transmit.segment_size.unwrap_or(transmit.contents.len());
     let expected_datagrams = transmit.contents.len() / segment_size;
-    let mut datagrams = 0;
-    while datagrams < expected_datagrams {
-        let n = recv_state
+    let mut received_datagrams = 0;
+
+    while received_datagrams < expected_datagrams {
+        let recv_count = recv_state
             .recv(
                 recv.into(),
-                &mut [IoSliceMut::new(&mut buf)],
-                slice::from_mut(&mut meta),
+                &mut [IoSliceMut::new(&mut receive_buffer)],
+                slice::from_mut(&mut recv_meta),
             )
             .unwrap();
-        assert_eq!(n, 1);
-        let segments = meta.len / meta.stride;
-        for i in 0..segments {
+        assert_eq!(recv_count, 1);
+
+        let received_segments = recv_meta.len / recv_meta.stride;
+        for segment_index in 0..received_segments {
             assert_eq!(
-                &buf[(i * meta.stride)..((i + 1) * meta.stride)],
-                &transmit.contents
-                    [(datagrams + i) * segment_size..(datagrams + i + 1) * segment_size]
+                &receive_buffer
+                    [(segment_index * recv_meta.stride)..((segment_index + 1) * recv_meta.stride)],
+                &transmit.contents[(received_datagrams + segment_index) * segment_size
+                    ..(received_datagrams + segment_index + 1) * segment_size]
             );
         }
-        datagrams += segments;
 
-        assert_eq!(
-            meta.addr.port(),
-            send.local_addr().unwrap().as_socket().unwrap().port()
-        );
-        let send_v6 = send.local_addr().unwrap().as_socket().unwrap().is_ipv6();
-        let recv_v6 = recv.local_addr().unwrap().as_socket().unwrap().is_ipv6();
-        let mut addresses = vec![meta.addr.ip()];
-        // Not populated on every OS. See `RecvMeta::dst_ip` for details.
-        if let Some(addr) = meta.dst_ip {
-            addresses.push(addr);
+        received_datagrams += received_segments;
+
+        assert_eq!(recv_meta.addr.port(), socket_addr(send).port());
+        let send_is_ipv6 = socket_addr(send).is_ipv6();
+        let recv_is_ipv6 = socket_addr(recv).is_ipv6();
+        let mut observed_addresses = vec![recv_meta.addr.ip()];
+        if let Some(destination_ip) = recv_meta.dst_ip {
+            observed_addresses.push(destination_ip);
         }
-        for addr in addresses {
-            match (send_v6, recv_v6) {
-                (_, false) => assert_eq!(addr, Ipv4Addr::LOCALHOST),
+        for observed_address in observed_addresses {
+            match (send_is_ipv6, recv_is_ipv6) {
+                (_, false) => assert_eq!(observed_address, Ipv4Addr::LOCALHOST),
                 // Windows gives us real IPv4 addrs, whereas *nix use IPv6-mapped IPv4
                 // addrs. Canonicalize to IPv6-mapped for robustness.
                 (false, true) => {
-                    assert_eq!(ip_to_v6_mapped(addr), Ipv4Addr::LOCALHOST.to_ipv6_mapped())
+                    assert_eq!(
+                        ip_to_v6_mapped(observed_address),
+                        Ipv4Addr::LOCALHOST.to_ipv6_mapped()
+                    )
                 }
                 (true, true) => assert!(
-                    addr == Ipv6Addr::LOCALHOST || addr == Ipv4Addr::LOCALHOST.to_ipv6_mapped()
+                    observed_address == Ipv6Addr::LOCALHOST
+                        || observed_address == Ipv4Addr::LOCALHOST.to_ipv6_mapped()
                 ),
             }
         }
@@ -355,12 +311,13 @@ fn test_send_recv(send: &Socket, recv: &Socket, transmit: Transmit<'_>) {
                 .expect("API_LEVEL environment variable to be set on Android")
                 <= 25
         {
-            assert_eq!(meta.ecn, None);
+            assert_eq!(recv_meta.ecn, None);
         } else {
-            assert_eq!(meta.ecn, transmit.ecn);
+            assert_eq!(recv_meta.ecn, transmit.ecn);
         }
     }
-    assert_eq!(datagrams, expected_datagrams);
+
+    assert_eq!(received_datagrams, expected_datagrams);
 }
 
 fn ip_to_v6_mapped(x: IpAddr) -> IpAddr {
@@ -370,94 +327,113 @@ fn ip_to_v6_mapped(x: IpAddr) -> IpAddr {
     }
 }
 
-/// Test Apple fast datapath enable/disable functionality.
-///
-/// This test verifies that:
-/// 1. `max_gso_segments()` returns 1 by default (fast path disabled)
-/// 2. After calling `set_apple_fast_path()`, `max_gso_segments()` returns `BATCH_SIZE`
-/// 3. Send/recv still works correctly with the fast path enabled
-#[test]
-#[cfg(apple_fast)]
-fn apple_fast_datapath() {
-    let send = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let recv = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let dst_addr = recv.local_addr().unwrap();
+fn bind_loopback_udp_socket() -> UdpSocket {
+    UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
+        .or_else(|_| UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)))
+        .unwrap()
+}
 
-    let send_state = UdpSocketState::new((&send).into()).unwrap();
-    let recv_state = UdpSocketState::new((&recv).into()).unwrap();
+fn bind_ipv4_udp_socket() -> UdpSocket {
+    UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap()
+}
 
-    // Initially, fast path should be disabled and max_gso_segments should be 1
-    assert!(
-        !send_state.is_apple_fast_path_enabled(),
-        "fast path should be disabled initially"
-    );
-    assert_eq!(
-        send_state.max_gso_segments(),
-        1,
-        "max_gso_segments should be 1 before enabling fast path"
-    );
+fn bind_ipv6_socket() -> Socket {
+    Socket::from(UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap())
+}
 
-    // Enable the fast path
-    // SAFETY: Assume that sendmsg_x/recvmsg_x are available on the macOS test host.
-    unsafe {
-        send_state.set_apple_fast_path();
-        recv_state.set_apple_fast_path();
-    }
+fn bind_ipv4_socket() -> Socket {
+    Socket::from(bind_ipv4_udp_socket())
+}
 
-    // After enabling, fast path should be enabled and max_gso_segments should be BATCH_SIZE
-    assert!(
-        send_state.is_apple_fast_path_enabled(),
-        "fast path should be enabled after calling set_apple_fast_path()"
-    );
-    assert_eq!(
-        send_state.max_gso_segments(),
-        quinn_udp::BATCH_SIZE,
-        "max_gso_segments should be BATCH_SIZE after enabling fast path"
-    );
-
-    // Verify send/recv still works with fast path enabled
-    recv.set_nonblocking(false).unwrap();
-
-    const SEGMENT_SIZE: usize = 128;
-    let segments = send_state.max_gso_segments();
-    let msg = vec![0xAB; SEGMENT_SIZE * segments];
-
-    send_state
-        .try_send(
-            (&send).into(),
-            &Transmit {
-                destination: dst_addr,
-                ecn: None,
-                contents: &msg,
-                segment_size: Some(SEGMENT_SIZE),
-                src_ip: None,
-            },
-        )
+fn bind_ipv4_socket_addr(socket: &Socket) {
+    socket
+        .bind(&socket2::SockAddr::from(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            0,
+        )))
         .unwrap();
+}
 
-    // Receive all segments
-    let mut buf = [0u8; u16::MAX as usize];
-    let mut total_received = 0;
-    while total_received < segments {
-        let mut meta = RecvMeta::default();
-        let n = recv_state
-            .recv(
-                (&recv).into(),
-                &mut [IoSliceMut::new(&mut buf)],
-                slice::from_mut(&mut meta),
-            )
-            .unwrap();
-        assert_eq!(n, 1);
-        let received_segments = meta.len / meta.stride;
-        for i in 0..received_segments {
-            assert_eq!(
-                &buf[i * meta.stride..(i + 1) * meta.stride],
-                &msg[(total_received + i) * SEGMENT_SIZE..(total_received + i + 1) * SEGMENT_SIZE],
-                "segment {} content mismatch",
-                total_received + i
-            );
-        }
-        total_received += received_segments;
+fn socket_addr(socket: &Socket) -> SocketAddr {
+    socket.local_addr().unwrap().as_socket().unwrap()
+}
+
+fn hello_transmit(destination: SocketAddr) -> Transmit<'static> {
+    Transmit {
+        destination,
+        ecn: None,
+        contents: HELLO_PAYLOAD,
+        segment_size: None,
+        src_ip: None,
     }
-    assert_eq!(total_received, segments, "should receive all segments");
+}
+
+fn hello_transmit_with_src_ip(destination: SocketAddr, src_ip: IpAddr) -> Transmit<'static> {
+    Transmit {
+        src_ip: Some(src_ip),
+        ..hello_transmit(destination)
+    }
+}
+
+fn ecn_transmit(destination: SocketAddr, codepoint: EcnCodepoint) -> Transmit<'static> {
+    Transmit {
+        ecn: Some(codepoint),
+        ..hello_transmit(destination)
+    }
+}
+
+fn gso_transmit<'a>(destination: SocketAddr, contents: &'a [u8]) -> Transmit<'a> {
+    Transmit {
+        destination,
+        ecn: None,
+        contents,
+        segment_size: Some(GSO_SEGMENT_SIZE),
+        src_ip: None,
+    }
+}
+
+fn assert_ecn_round_trip(send: &Socket, recv: &Socket, destination: SocketAddr) {
+    for codepoint in ECN_CODEPOINTS {
+        test_send_recv(send, recv, ecn_transmit(destination, codepoint));
+    }
+}
+
+fn assert_socket_buffer_sizes_can_be_configured(socket: &Socket) {
+    let factor = socket_buffer_size_factor();
+    let socket_state = UdpSocketState::new(socket.into()).expect("created socket state");
+
+    let send_buffer_before = socket_state.send_buffer_size(socket.into()).unwrap();
+    assert_ne!(
+        send_buffer_before,
+        SOCKET_BUFFER_SIZE * factor,
+        "make sure buffer is not already desired size"
+    );
+    socket_state
+        .set_send_buffer_size(socket.into(), SOCKET_BUFFER_SIZE)
+        .expect("set send buffer size {send_buffer_before} -> {SOCKET_BUFFER_SIZE}");
+    let send_buffer_after = socket_state.send_buffer_size(socket.into()).unwrap();
+    assert_eq!(
+        send_buffer_after,
+        SOCKET_BUFFER_SIZE * factor,
+        "setting send buffer size to {SOCKET_BUFFER_SIZE} resulted in {send_buffer_before} -> {send_buffer_after}",
+    );
+
+    let recv_buffer_before = socket_state.recv_buffer_size(socket.into()).unwrap();
+    socket_state
+        .set_recv_buffer_size(socket.into(), SOCKET_BUFFER_SIZE)
+        .expect("set recv buffer size {recv_buffer_before} -> {SOCKET_BUFFER_SIZE}");
+    let recv_buffer_after = socket_state.recv_buffer_size(socket.into()).unwrap();
+    assert_eq!(
+        recv_buffer_after,
+        SOCKET_BUFFER_SIZE * factor,
+        "setting recv buffer size to {SOCKET_BUFFER_SIZE} resulted in {recv_buffer_before} -> {recv_buffer_after}",
+    );
+}
+
+fn socket_buffer_size_factor() -> usize {
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        2
+    } else {
+        1
+    }
 }

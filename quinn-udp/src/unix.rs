@@ -189,7 +189,7 @@ impl UdpSocketState {
         }
 
         let now = Instant::now();
-        Ok(Self {
+        let state = Self {
             last_send_error: Mutex::new(now.checked_sub(2 * IO_ERROR_LOG_INTERVAL).unwrap_or(now)),
             max_gso_segments: AtomicUsize::new(gso::max_gso_segments(&*io)),
             gro_segments,
@@ -197,7 +197,13 @@ impl UdpSocketState {
             sendmsg_einval: AtomicBool::new(false),
             #[cfg(apple_fast)]
             apple_fast_path: AtomicBool::new(false),
-        })
+        };
+        // When compiled with `fast-apple-datapath`, opt in automatically.
+        // The fast path verifies symbol availability via `dlsym` on first use and
+        // disables itself gracefully if `sendmsg_x`/`recvmsg_x` are not available.
+        #[cfg(apple_fast)]
+        state.set_apple_fast_path();
+        Ok(state)
     }
 
     /// Sends a [`Transmit`] on the given socket.
@@ -342,14 +348,12 @@ impl UdpSocketState {
     /// Enables Apple's fast UDP datapath using private `sendmsg_x`/`recvmsg_x` APIs.
     /// Once enabled, this also updates [`max_gso_segments`] to allow batched sends.
     ///
-    /// # Safety
-    ///
-    /// These APIs may crash on unsupported OS versions, so callers must verify
-    /// availability before enabling.
+    /// Symbol availability is verified at runtime via `dlsym`; if the symbols are absent
+    /// the fast path is automatically disabled on the first send/recv call.
     ///
     /// [`max_gso_segments`]: Self::max_gso_segments
     #[cfg(apple_fast)]
-    pub unsafe fn set_apple_fast_path(&self) {
+    pub fn set_apple_fast_path(&self) {
         self.apple_fast_path.store(true, Ordering::Relaxed);
         self.max_gso_segments.store(BATCH_SIZE, Ordering::Relaxed);
     }
@@ -1248,5 +1252,104 @@ fn retry_if_interrupted(mut f: impl FnMut() -> isize) -> io::Result<isize> {
         if e.kind() != io::ErrorKind::Interrupted {
             return Err(e);
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(apple_fast)]
+mod apple_fast_tests {
+    use std::net::{Ipv4Addr, UdpSocket};
+
+    use super::*;
+
+    fn make_state() -> (UdpSocketState, UdpSocket) {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let state = UdpSocketState::new((&socket).into()).unwrap();
+        (state, socket)
+    }
+
+    /// Fast path should be enabled automatically by `UdpSocketState::new()`.
+    #[test]
+    fn fast_path_enabled_on_new() {
+        let (state, _socket) = make_state();
+        assert!(
+            state.is_apple_fast_path_enabled(),
+            "fast path should be enabled automatically after new()"
+        );
+        assert_eq!(
+            state.max_gso_segments(),
+            BATCH_SIZE,
+            "max_gso_segments should equal BATCH_SIZE when fast path is enabled"
+        );
+    }
+
+    /// `disable_apple_fast_path` should reset both the flag and `max_gso_segments`.
+    #[test]
+    fn disable_resets_gso_segments() {
+        let (state, _socket) = make_state();
+        state.disable_apple_fast_path();
+        assert!(
+            !state.is_apple_fast_path_enabled(),
+            "fast path should be disabled after disable_apple_fast_path()"
+        );
+        assert_eq!(
+            state.max_gso_segments(),
+            1,
+            "max_gso_segments should be 1 after disabling the fast path"
+        );
+    }
+
+    /// `set_apple_fast_path` after a disable should re-enable and restore `max_gso_segments`.
+    #[test]
+    fn reenable_restores_gso_segments() {
+        let (state, _socket) = make_state();
+        state.disable_apple_fast_path();
+        state.set_apple_fast_path();
+        assert!(state.is_apple_fast_path_enabled());
+        assert_eq!(state.max_gso_segments(), BATCH_SIZE);
+    }
+
+    /// When a resolver returns `None` (simulating a missing `dlsym` symbol), the fast path
+    /// must be automatically disabled so future calls take the slow path.
+    #[test]
+    fn resolve_fn_disables_fast_path_on_missing_symbol() {
+        let (state, _socket) = make_state();
+        assert!(
+            state.is_apple_fast_path_enabled(),
+            "precondition: fast path enabled"
+        );
+
+        fn missing_symbol() -> Option<usize> {
+            None // simulates dlsym returning NULL
+        }
+        let result = state.resolve_apple_fast_fn(missing_symbol);
+
+        assert!(result.is_none());
+        assert!(
+            !state.is_apple_fast_path_enabled(),
+            "fast path must be disabled when the symbol is absent"
+        );
+        assert_eq!(
+            state.max_gso_segments(),
+            1,
+            "max_gso_segments must be reset to 1 when the symbol is absent"
+        );
+    }
+
+    /// When a resolver returns `Some`, the fast path must remain enabled.
+    #[test]
+    fn resolve_fn_keeps_fast_path_on_present_symbol() {
+        let (state, _socket) = make_state();
+
+        fn present_symbol() -> Option<usize> {
+            Some(0xdeadbeef) // simulates a valid dlsym address
+        }
+        let result = state.resolve_apple_fast_fn(present_symbol);
+
+        assert_eq!(result, Some(0xdeadbeef));
+        assert!(
+            state.is_apple_fast_path_enabled(),
+            "fast path should remain enabled when the symbol is present"
+        );
     }
 }
